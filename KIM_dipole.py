@@ -135,7 +135,7 @@ angle = angle[ia]
 c3 = c3[ia]
 
 # compute complementary supercell repeat vector
-c1 = np.cross(c2, c3)
+c1 = np.cross(c3, c2)
 
 # determine supercell size
 m1 = np.gcd(c1[:,0], np.gcd(c1[:,1], c1[:,2]))

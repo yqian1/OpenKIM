@@ -1,0 +1,1592 @@
+#!/usr/bin/env python3
+# """
+# This Test Driver computes the dislocation core energy of a cubic crystal at zero temperature and a given stress state for a specified dislocation core cut-# off radius.
+
+# First, it generates dipole dislocation cores with distances of 10*a 20*a 30*a 40*a 50*a (where a is the lattice constant), by using MD++.
+# Second, by specifying a dislocation core radius, it will calculate the dislocation core energy.
+
+# Author: Yichen Qian, Villanova University 2020.Mar
+# """
+
+import os
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+import subprocess
+import gzip
+import shutil
+from kim_query import get_lattice_constant_cubic
+from kim_query import get_cohesive_energy_cubic
+from kim_query import get_elastic_constants_isothermal_cubic
+from kim_property import kim_property_create, kim_property_modify, kim_property_dump
+from ovito import dataset
+from ovito.io import *
+from ovito.modifiers import *
+from ovito.data import *
+import sys
+
+
+def extract_position(filename):
+
+	print('filename = %s' % filename)
+	if not os.path.isfile(filename):
+		print(' ERROR: File %s does not exist' % filename)
+		return
+
+	pos = np.zeros((2,2))
+
+	node = import_file(filename)
+	data = node.compute()
+	na = data.particles.count
+
+	# Extract dipole position using DXA
+	if 0:
+		modifier = DislocationAnalysisModifier()
+		modifier.input_crystal_structure = DislocationAnalysisModifier.Lattice.BCC
+		node.modifiers.append(modifier)
+		data = node.compute()
+
+		# Print list of dislocation lines:
+		network = data.dislocations
+		print(' DXA: Found %i dislocation segment(s)' % len(network.segments))
+
+		if len(network.segments) == 2:
+			for segment in network.segments:
+				print(' Segment %i: length=%f, Burgers vector=%s' % (segment.id, segment.length, segment.true_burgers_vector))
+				pos[segment.id,0] = np.mean(segment.points[:,0])
+				pos[segment.id,1] = np.mean(segment.points[:,1])
+				print('  average x,y position = %f %f' % (pos[segment.id,0], pos[segment.id,1]))
+		else:
+			print(' Error: must found exactly 2 dislocations')
+
+	# Extract dipole position using CNA
+	if 1:
+		cna = CommonNeighborAnalysisModifier()
+		select_perfect = SelectExpressionModifier(expression = 'StructureType==3')
+		delete_selected = DeleteSelectedParticlesModifier()
+		ca = ClusterAnalysisModifier()
+		node.modifiers.append(cna)
+		node.modifiers.append(select_perfect)
+		node.modifiers.append(delete_selected)
+		node.modifiers.append(ca)
+		data = node.compute()
+
+		nc = data.attributes['ClusterAnalysis.cluster_count']
+		print(' CNA: Found %i dislocation segment(s)' % nc)
+
+		if nc == 2:
+			positions = data.particles['Position']
+			idx = np.digitize(data.particles['Cluster']-1, bins=[0,1])-1
+			for i in range(2):
+				# Fold x positions wrt first point in cluster
+				posx = positions[idx==i,0]
+				Lx = data.cell.matrix[0,0]
+				posx = posx - np.rint((posx-posx[0])*1./Lx)*Lx
+				pos[i,0] = np.mean(posx)
+				pos[i,1] = np.mean(positions[idx==i,1])
+				print(' Segment %i:' % i)
+				print('  average x,y position = %f %f' % (pos[i,0], pos[i,1]))
+		else:
+			print(' Error: must found exactly 2 dislocations')
+	cvec = data.cell.matrix[0:2,0:2].T
+	return pos,cvec
+
+
+
+def stripquotes(matchobj):
+    return matchobj.group(1)
+
+
+# Define the lammps running function
+def run_lammps(infile, outfile):
+    """Run LAMMPS with given input file and write the output to outfile"""
+    with open(outfile, "w") as outfl:
+        try:
+            subprocess.check_call(["lammps", "-in", infile], shell=False, stdout=outfl)
+        except subprocess.CalledProcessError:
+            extrainfo = ""
+            try:
+                with open("log.lammps") as f:
+                    extrainfo = f.read()
+            except IOError:
+                extrainfo = "no log file"
+            raise Exception("LAMMPS did not exit properly:\n" + extrainfo)
+
+
+# Define the lattice type by full name(will use in generating dipole structure)
+def get_lattice_type_full_name(lattice_type):
+    full_names = {"bcc":  "body-centered-cubic",
+                  "fcc": "face-centered-cubic",
+                  "diamond": "diamond-cubic",
+                  "sc": "simple_cubic"}
+    return full_names[lattice_type]
+
+
+def get_basis_atom_coordinates(lattice_type):
+    basis_atom_coordinates = {
+        "bcc": [[0.0, 0.0, 0.0], [0.5, 0.5, 0.5]],
+        "diamond": [
+            [0.0, 0.0, 0.0],
+            [0.25, 0.25, 0.25],
+            [0.5, 0.5, 0.0],
+            [0.75, 0.75, 0.25],
+            [0.5, 0.0, 0.5],
+            [0.75, 0.25, 0.75],
+            [0.0, 0.5, 0.5],
+            [0.25, 0.75, 0.75],
+        ],
+        "fcc": [[0.0, 0.0, 0.0], [0.5, 0.5, 0.0], [0.5, 0.0, 0.5], [0.0, 0.5, 0.5]],
+        "sc": [[0.0, 0.0, 0.0]],
+    }
+    return basis_atom_coordinates[lattice_type]
+
+
+def format_basis_atom_coordinates(basis_atom_coordinates):
+    """
+    Takes a nested list of basis atom coordinates and creates a list that can
+    be splatted into a kim_property modify command
+    """
+    output = []
+    for ind, atom in enumerate(basis_atom_coordinates):
+        output += ["source-value", str(ind + 1), "1:3", *list(map(str, atom))]
+    return output
+
+
+def format_species(element, lattice_type):
+    """
+    Produces a list of appropriate length containing the (single) element
+    provided as input that can be splatted into a kim_property modify command
+    """
+    num_basis_atoms = {"bcc": 2, "diamond": 8, "fcc": 4, "sc": 1}
+    Natoms = num_basis_atoms[lattice_type]
+    return ["source-value", f"1:{Natoms}", *[element] * Natoms]
+
+
+def get_space_group(lattice_type):
+    space_groups = {"fcc": "Fm-3m", "bcc": "Im-3m", "sc": "Pm-3m", "diamond": "Fd-3m"}
+    return space_groups[lattice_type]
+
+
+# # File: madsum_iso.m
+# #
+# # Last Modified : Sun Aug  8 16:09:39 2004
+# # Wei Cai, caiwei@stanford.edu
+# #
+# # References:
+# #
+# #     Wei Cai, Vasily V. Bulatov, Jinpeng Chang, Ju Li and Sidney Yip,
+# #     Periodic image effects in dislocation modelling,
+# #     Philosophical Magazine A, 83, 539 (2003).
+# #     ( for regularization of conditional convergence )
+# #
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+#
+#  This function calculates the elastic energy of a dislocation
+#  dipole in a supercell under periodic boundary conditions
+#
+#  Geometry:
+#
+#    (x1,y1)   A-------------------------------------
+#               \                                    \
+#                \      P                             \
+#                 \    (-) (x2r,y2r)                   \
+#                  \   /                                \
+#                   \ /                                  \
+#                   (+)-----------------------------------B (x0,0)
+#
+#  Input:
+#     mu:   shear modulus (in eV/A^3,  1eV/A^3 = 160.22GPa )
+#     nu:   Poisson's ratio
+#     b      = [ bx, by, bz ]              Burgers vector
+#     rc:   cut-off radius
+#     coords = [ x0, x1, y1, x2r, y2r ]
+#           x0            x coord of B     (0, infty)     (in A)
+#           x1            x coord of A     (-infty,infty) (in A)
+#           y1            y coord of A     (0,  infty)
+#           x2r   reduced x coord of P     (-0.5, 0.5]
+#           y2r   reduced y coord of P     (-0.5, 0.5]
+#    trunc = [ xcut, ycut ] truncation paramters
+#           -xcut:xcut times -ycut:ycut number of images will be added
+#
+#  Output:
+#     Eel:  total elastic energy, Eel = Eprm + Eimg
+#     Eprm: primary dipole energy
+#     Eimg: image energy
+#     Esum = [ lnR, xxR2, yyR2, xyR2 ] : intermediate results
+#            lnR :    sum of ln(R/rc)
+#            xxR2:    sum of x*x/R^2
+#            yyR2:    sum of y*y/R^2
+#            xyR2:    sum of x*y/R^2
+#
+def madsum_nonsingular(mu, nu, b, a, coord, trunc):
+    
+    x0 = coord[0]
+    x1 = coord[1]
+    y1 = coord[2]
+    x2r = coord[3]
+    y2r = coord[4]
+    
+    xcut = trunc[0]
+    ycut = trunc[1]
+    
+    c1 = np.array([x0, 0.])
+    c2 = np.array([x1, y1])
+    ds = np.array([x2r, y2r])
+    dr = np.matmul(np.vstack((c1,c2)).T, ds)
+    R = np.linalg.norm(dr)
+    Ra2 = R**2+a**2
+    Ra = np.sqrt(Ra2)
+    dt = dr/Ra
+    
+    prm = np.array([np.log(Ra/a), 1./Ra2, 1., dt[0]**2, dt[1]**2, dt[0]*dt[1]])
+    
+    Efac = -mu/4.0/np.pi*np.array([b[2]**2+1./(1.-nu)*(b[0]**2+b[1]**2),
+                                   -0.5*a**2*b[2]**2,
+                                   0.5*b[2]**2,
+                                   1./(1.-nu)*b[1]**2,
+                                   1./(1.-nu)*b[0]**2,
+                                   -1./(1.-nu)*2.*b[0]*b[1]])
+    
+    Eprm = np.sum(Efac*prm)*(-2.0)
+    
+    # Add image contribution (naive summation)
+    # image coordinate (x,y)  image strength
+    image = np.array([[0., 0., 2.],
+                      [dr[0], dr[1], -1.],
+                      [-dr[0], -dr[1], -1.]])
+       
+    
+    xc = np.arange(-xcut, xcut+1)
+    yc = np.arange(-ycut, ycut+1)
+    Xim, Yim = np.meshgrid(xc, yc)
+    Xim = np.tile(Xim.reshape(xc.size,yc.size,1), (1,1,2))
+    Yim = np.tile(Yim.reshape(xc.size,yc.size,1), (1,1,2))
+    offset = Xim*c1 + Yim*c2
+    offset = offset.reshape(-1,2)
+        
+    Esum = np.zeros(6,)
+    offset0 = offset[(offset[:,0]!=0)|(offset[:,1]!=0)]
+    for k in range(image.shape[0]):
+        dR = offset0 + image[k,0:2]
+        R = np.sqrt(np.sum(dR**2, axis=1, keepdims=True))
+        Ra2 = R**2+a**2
+        Ra = np.sqrt(Ra2)
+        dt = dR/np.tile(Ra, (1,2))
+        Esum += image[k,2]*np.sum(np.hstack([np.log(Ra/a), 1./Ra2, np.ones(Ra.shape), 
+                                             dt**2, np.prod(dt, axis=1, keepdims=True)]), axis=0)   
+        
+    
+    # Add ghost contribution (correction for conditional convergence)
+    # ghost coordinate (x,y)        ghost strength
+    ghost = np.array([[ c1[0]/2.-dr[0]/2.,  c1[1]/2.-dr[1]/2.,  x2r],
+                      [-c1[0]/2.-dr[0]/2., -c1[1]/2.-dr[1]/2., -x2r],
+                      [ c1[0]/2.+dr[0]/2.,  c1[1]/2.+dr[1]/2., -x2r],
+                      [-c1[0]/2.+dr[0]/2., -c1[1]/2.+dr[1]/2.,  x2r],
+                      [ c2[0]/2.-dr[0]/2.,  c2[1]/2.-dr[1]/2.,  y2r],
+                      [-c2[0]/2.-dr[0]/2., -c2[1]/2.-dr[1]/2., -y2r],
+                      [ c2[0]/2.+dr[0]/2.,  c2[1]/2.+dr[1]/2., -y2r],
+                      [-c2[0]/2.+dr[0]/2., -c2[1]/2.+dr[1]/2.,  y2r]])
+        
+    Egst = np.zeros(6,)
+    for k in range(ghost.shape[0]):
+        dR = offset + ghost[k,0:2]
+        R = np.sqrt(np.sum(dR**2, axis=1, keepdims=True))
+        Ra2 = R**2+a**2
+        Ra = np.sqrt(Ra2)
+        dt = dR/np.tile(Ra, (1,2))
+        Egst -= ghost[k,2]*np.sum(np.hstack([np.log(Ra/a), 1./Ra2, np.ones(Ra.shape),
+                                             dt**2, np.prod(dt, axis=1, keepdims=True)]), axis=0)
+        
+
+    Esum = Esum + Egst
+    Eimg = np.sum(Efac*Esum)
+    Eel = Eprm + Eimg
+    
+    return Eel, Eprm, Eimg
+
+
+'''
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Function: madsum_iso()
+%%
+%% Nicolas Bertin, bertin1@llnl.gov
+%% Based on the implemetation by Wei Cai, caiwei@stanford.edu
+%%
+%% References:
+%%
+%%     Wei Cai, Vasily V. Bulatov, Jinpeng Chang, Ju Li and Sidney Yip,
+%%     Periodic image effects in dislocation modelling,
+%%     Philosophical Magazine A, 83, 539 (2003).
+%%     ( for regularization of conditional convergence )
+%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  This program calculates the elastic energy of a dislocation
+%  dipole in a supercell under periodic boundary conditions
+%   
+%  Geometry:
+%
+%    (x1,y1)   A-------------------------------------
+%               \                                    \
+%                \      P                             \
+%                 \    (-) (x2r,y2r)                   \
+%                  \   /                                \
+%                   \ /                                  \
+%                   (+)-----------------------------------B (x0,0)
+%
+%  Input:
+%     mu:   shear modulus (in eV/A^3,  1eV/A^3 = 160.22GPa )
+%     nu:   Poisson's ratio
+%     b      = [ bx, by, bz ]              Burgers vector
+%     rc:   cut-off radius
+%     coords = [ x0, x1, y1, x2r, y2r ]
+%           x0            x coord of B     (0, infty)     (in A)
+%           x1            x coord of A     (-infty,infty) (in A)
+%           y1            y coord of A     (0,  infty)
+%           x2r   reduced x coord of P     (-0.5, 0.5]
+%           y2r   reduced y coord of P     (-0.5, 0.5]
+%    trunc = [ xcut, ycut ] truncation paramters
+%           -xcut:xcut times -ycut:ycut number of images will be added
+%     
+%  Output:
+%     Eel:  total elastic energy, Eel = Eprm + Eimg
+%     Eprm: primary dipole energy
+%     Eimg: image energy
+%     Esum = [ lnR, xxR2, yyR2, xyR2 ] : intermediate results
+%            lnR :    sum of ln(R/rc)
+%            xxR2:    sum of x*x/R^2
+%            yyR2:    sum of y*y/R^2
+%            xyR2:    sum of x*y/R^2
+%
+'''
+def madsum_iso(mu, nu, b, rc, coord, trunc):
+    
+    x0 = coord[0]
+    x1 = coord[1]
+    y1 = coord[2]
+    x2r = coord[3]
+    y2r = coord[4]
+    
+    xcut = trunc[0]
+    ycut = trunc[1]
+    
+    c1 = np.array([x0, 0.])
+    c2 = np.array([x1, y1])
+    ds = np.array([x2r, y2r])
+    dr = np.matmul(np.vstack((c1,c2)).T, ds)
+    R = np.linalg.norm(dr)
+    print("this is R :", R)
+    dt = dr/R
+    
+    prm = np.array([np.log(R/rc), dt[0]**2, dt[1]**2, dt[0]*dt[1]])
+    
+    Efac = -(mu/4.0/np.pi)*np.array([(b[0]**2+b[1]**2)/(1.-nu)+b[2]**2,
+                                     b[1]**2/(1.-nu),
+                                     b[0]**2/(1.-nu),
+                                     -2.*b[0]*b[1]/(1.-nu)])
+    
+    Eprm = np.sum(Efac*prm)*(-2.0)
+    
+    # Add image contribution (naive summation)
+    # image coordinate (x,y)  image strength
+    image = np.array([[0., 0., 2.],
+                      [dr[0], dr[1], -1.],
+                      [-dr[0], -dr[1], -1.]])
+       
+    
+    xc = np.arange(-xcut, xcut+1)
+    yc = np.arange(-ycut, ycut+1)
+    Xim, Yim = np.meshgrid(xc, yc)
+    Xim = np.tile(Xim.reshape(xc.size,yc.size,1), (1,1,2))
+    Yim = np.tile(Yim.reshape(xc.size,yc.size,1), (1,1,2))
+    offset = Xim*c1 + Yim*c2
+    offset = offset.reshape(-1,2)
+        
+    Esum = np.zeros(4,)
+    offset0 = offset[(offset[:,0]!=0)|(offset[:,1]!=0)]
+    for k in range(image.shape[0]):
+        dR = offset0 + image[k,0:2]
+        R = np.sqrt(np.sum(dR**2, axis=1, keepdims=True))
+        dt = dR/np.tile(R, (1,2))
+        Esum += image[k,2]*np.sum(np.hstack((np.log(R/rc), dt**2, np.prod(dt, axis=1, keepdims=True))), axis=0)   
+        
+    
+    # Add ghost contribution (correction for conditional convergence)
+    # ghost coordinate (x,y)        ghost strength
+    ghost = np.array([[ c1[0]/2.-dr[0]/2.,  c1[1]/2.-dr[1]/2.,  x2r],
+                      [-c1[0]/2.-dr[0]/2., -c1[1]/2.-dr[1]/2., -x2r],
+                      [ c1[0]/2.+dr[0]/2.,  c1[1]/2.+dr[1]/2., -x2r],
+                      [-c1[0]/2.+dr[0]/2., -c1[1]/2.+dr[1]/2.,  x2r],
+                      [ c2[0]/2.-dr[0]/2.,  c2[1]/2.-dr[1]/2.,  y2r],
+                      [-c2[0]/2.-dr[0]/2., -c2[1]/2.-dr[1]/2., -y2r],
+                      [ c2[0]/2.+dr[0]/2.,  c2[1]/2.+dr[1]/2., -y2r],
+                      [-c2[0]/2.+dr[0]/2., -c2[1]/2.+dr[1]/2.,  y2r]])
+        
+    Egst = np.zeros(4,)
+    for k in range(ghost.shape[0]):
+        dR = offset + ghost[k,0:2]
+        R = np.sqrt(np.sum(dR**2, axis=1, keepdims=True))
+        dt = dR/np.tile(R, (1,2))
+        Egst -= ghost[k,2]*np.sum(np.hstack((np.log(R/rc), dt**2, np.prod(dt, axis=1, keepdims=True))), axis=0)
+        
+
+    Esum = Esum + Egst
+    Eimg = np.sum(Efac*Esum)
+    Eel = Eprm + Eimg
+    
+    return Eel, Eprm, Eimg
+
+'''
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Function: sextic()
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% Classical sextic formalism of anisotropic linear elasticity for
+% dislocations
+%
+% [p,A,B,D]=sextic(b,C)
+% Inputs:  b(3)          Burger's vector
+%          C(3,3,3,3)    Elastic Constant Matrix
+% Outputs: p(6)          Six roots of the sextic polynomial p(n)
+%          A(3,3)        A(k,n)
+%          B{3}(3,3,3)   B{n}(i,j,k)
+%          D(3)          D(n)
+%
+% Displacement field of dislocation (along z direction)
+%         u(k)=Re(-1/(2*pi*i)*Sum_{n=1}^{3}(A(k,n)*D(n)*ln(eta(n)))) ,
+%         where eta(n)=x+p(n)*y
+'''
+def sextic(b, C):
+    
+    # Construct Poly6
+    c0 = C[:,0,:,0]
+    c1 = C[:,0,:,1] + C[:,1,:,0]
+    c2 = C[:,1,:,1]
+
+    Poly6 = np.zeros((7,))
+    Poly6[6] = np.linalg.det(c0)
+    Poly6[5] = \
+    np.linalg.det(np.vstack([c0[:,0],c0[:,1],c1[:,2]]).T) + \
+    np.linalg.det(np.vstack([c0[:,0],c1[:,1],c0[:,2]]).T) + \
+    np.linalg.det(np.vstack([c1[:,0],c0[:,1],c0[:,2]]).T)
+    Poly6[4] = \
+    np.linalg.det(np.vstack([c0[:,0],c0[:,1],c2[:,2]]).T) + \
+    np.linalg.det(np.vstack([c0[:,0],c2[:,1],c0[:,2]]).T) + \
+    np.linalg.det(np.vstack([c2[:,0],c0[:,1],c0[:,2]]).T) + \
+    np.linalg.det(np.vstack([c0[:,0],c1[:,1],c1[:,2]]).T) + \
+    np.linalg.det(np.vstack([c1[:,0],c0[:,1],c1[:,2]]).T) + \
+    np.linalg.det(np.vstack([c1[:,0],c1[:,1],c0[:,2]]).T)
+    Poly6[3] = \
+    np.linalg.det(np.vstack([c0[:,0],c1[:,1],c2[:,2]]).T) + \
+    np.linalg.det(np.vstack([c1[:,0],c0[:,1],c2[:,2]]).T) + \
+    np.linalg.det(np.vstack([c0[:,0],c2[:,1],c1[:,2]]).T) + \
+    np.linalg.det(np.vstack([c1[:,0],c2[:,1],c0[:,2]]).T) + \
+    np.linalg.det(np.vstack([c2[:,0],c0[:,1],c1[:,2]]).T) + \
+    np.linalg.det(np.vstack([c2[:,0],c1[:,1],c0[:,2]]).T) + \
+    np.linalg.det(np.vstack([c1[:,0],c1[:,1],c1[:,2]]).T)
+    Poly6[2] = \
+    np.linalg.det(np.vstack([c1[:,0],c1[:,1],c2[:,2]]).T) + \
+    np.linalg.det(np.vstack([c1[:,0],c2[:,1],c1[:,2]]).T) + \
+    np.linalg.det(np.vstack([c2[:,0],c1[:,1],c1[:,2]]).T) + \
+    np.linalg.det(np.vstack([c0[:,0],c2[:,1],c2[:,2]]).T) + \
+    np.linalg.det(np.vstack([c2[:,0],c0[:,1],c2[:,2]]).T) + \
+    np.linalg.det(np.vstack([c2[:,0],c2[:,1],c0[:,2]]).T)
+    Poly6[1] = \
+    np.linalg.det(np.vstack([c1[:,0],c2[:,1],c2[:,2]]).T) + \
+    np.linalg.det(np.vstack([c2[:,0],c1[:,1],c2[:,2]]).T) + \
+    np.linalg.det(np.vstack([c2[:,0],c2[:,1],c1[:,2]]).T)
+    Poly6[0] = np.linalg.det(c2)
+    
+    # Solve the Polynomial
+    cp = np.roots(Poly6)
+
+    # Sort roots
+    ind = np.argsort(-np.imag(cp))
+    p = cp
+    p[0:3] = cp[ind[0:3]]
+    p[3:6] = np.conj(p[0:3])
+ 
+    # Construct Matrix A
+    a = []
+    if (np.abs(p[0]-1j)<1e-4) & (np.abs(p[1]-1j)<1e-4) & (np.abs(p[2]-1j)<1e-4):
+        print('degeneracy!')
+        for n in range(3):
+            a.append(c0+c1*p[n]+c2*p[n]**2)
+        A = np.array([[1.,-1j,0.],[1j,1.,0.],[0.,0.,1.]])
+    else:
+        A = np.zeros((3,3), dtype=complex)
+        for n in range(3):
+            a.append(c0+c1*p[n]+c2*p[n]**2)
+            w, v = np.linalg.eig(a[n])
+            t = np.argsort(np.abs(w))
+            A[:,n] = v[:,t[0]]
+      
+    # Construct Matrix B
+    B = []
+    for n in range(3):
+        B.append(C[:,:,:,0]+C[:,:,:,1]*p[n])
+
+    F = np.zeros((3,3), dtype=complex)
+    for j in range(3):
+        for n in range(3):
+            F[j,n] = B[n][j,1,0]*A[0,n]+B[n][j,1,1]*A[1,n]+B[n][j,1,2]*A[2,n]
+    
+    G = np.zeros((6,6))
+    G[0:3,0:3] = np.real(A)
+    G[0:3,3:6] = -np.imag(A)
+    G[3:6,0:3] = np.real(F)
+    G[3:6,3:6] = -np.imag(F)
+    
+    rhs = np.zeros((6,))
+    rhs[0:3] = b
+    lhs = np.linalg.solve(G, rhs)
+    D = lhs[0:3]+1j*lhs[3:6]
+    
+    return p, A, B, D, Poly6, a, c0, c1, c2
+
+'''
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Function: madsum_aniso()
+%%
+%% Nicolas Bertin, bertin1@llnl.gov
+%% Based on the implemetation by Wei Cai, caiwei@stanford.edu
+%%
+%% References:
+%%
+%%  1. W. Cai, Atomistic and Mesoscale Modeling of Dislocation Mobility, 
+%%     Ph. D. Thesis, Massachusetts Institute of Technology, 2001. 
+%%     ( http://asm.mit.edu/caiwei/Download/Thesis/CaiWeiThesis.pdf 
+%%       p. 296, for dislocation interaction energy in anisotropic medium. )
+%%
+%%  2. Wei Cai, Vasily V. Bulatov, Jinpeng Chang, Ju Li and Sidney Yip,
+%%     Periodic image effects in dislocation modelling,
+%%     Philosophical Magazine A, 83, 539 (2003).
+%%     ( for regularization of conditional convergence )
+%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  This program calculates the elastic energy of a dislocation
+%  dipole in a supercell under periodic boundary conditions
+%   
+%  Geometry:
+%
+%    (x1,y1)   A-------------------------------------
+%               \                                    \
+%                \      P                             \
+%                 \    (-) (x2r,y2r)                   \
+%                  \   /                                \
+%                   \ /                                  \
+%                   (+)-----------------------------------B (x0,0)
+%
+%  Input:
+%     C0:    C(i,j,k,l) general elastic constant tensor (in eV/A^3,  1eV/A^3 = 160.22GPa )
+%     b0 = [ bx, by, bz ] Burgers vector in unit cell frame (in Angstrom)
+%                        e.g. b0 = [ 1 1 1 ]/2 * 3.1472 (for Molybdenum)
+%     M = [ e1, e2, e3 ] coordinate transformation matrix, 
+%                        e3 is parallel to dislocation line
+%     rc:   cut-off radius
+%     coords = [ x0, x1, y1, x2r, y2r ]
+%           x0            x coord of B     (0, infty)     (in A)
+%           x1            x coord of A     (-infty,infty) (in A)
+%           y1            y coord of A     (0,  infty)
+%           x2r   reduced x coord of P     (-0.5, 0.5]
+%           y2r   reduced y coord of P     (-0.5, 0.5]
+%    trunc = [ xcut, ycut ] truncation paramters
+%           -xcut:xcut times -ycut:ycut number of images will be added
+%     
+%  Output:
+%     Eel:  total elastic energy, Eel = Eprm + Eimg
+%     Eprm: primary dipole energy
+%     Eimg: image energy
+%     Esum = [ lnR, xxR2, yyR2, xyR2 ] : intermediate results
+%            lnR :    sum of ln(R/rc)
+%            xxR2:    sum of x*x/R^2
+%            yyR2:    sum of y*y/R^2
+%            xyR2:    sum of x*y/R^2
+%
+'''
+def madsum_aniso(C0, b0, M, rc, coord, trunc):
+    
+    #Step 1: Solve the energy prefactor in anisotropic elasticity
+
+    #Transform C
+    Mt = M.T
+    C = np.zeros((3,3,3,3))
+    for i in range(3):
+        for j in range(3):
+            for k in range(3):
+                for l in range(3):
+                    tmp = 0.0
+                    for ip in range(3):
+                        for jp in range(3):
+                            for kp in range(3):
+                                for lp in range(3):
+                                    tmp += Mt[i,ip]*Mt[j,jp]*Mt[k,kp]*Mt[l,lp]*C0[ip,jp,kp,lp]
+                    C[i,j,k,l] = tmp
+    # Transform b
+    b = np.matmul(Mt, b0)
+
+    # Solve the sextic equation in the coordinate specified by M
+    p, A, B, D, poly6, a, c0, c1, c2 = sextic(b, C)
+
+    # Calculate interaction matrix h1b(i,n)
+    # only p and h1b are used in following calculations
+    h1 = np.zeros((3,3), dtype=complex)
+    for n in range(3):
+        for i in range(3):
+            h1[i,n] = B[n][i,1,0]*A[0,n]*D[n]+B[n][i,1,1]*A[1,n]*D[n]+B[n][i,1,2]*A[2,n]*D[n]
+    
+    h1b = np.matmul(h1.T, b)
+    
+    # Step 2: image summation
+    #
+    # (Ref. 1, p. 296)
+    # W(x,y) = sum_{n=1}^{3} Re[ h1b(n) / (2*pi*I) * ln (x+p_n*y)/rc ]
+    
+    x0 = coord[0]
+    x1 = coord[1]
+    y1 = coord[2]
+    x2r = coord[3]
+    y2r = coord[4]
+    
+    xcut = trunc[0]
+    ycut = trunc[1]
+    
+    c1 = np.array([x0, 0.])
+    c2 = np.array([x1, y1])
+    ds = np.array([x2r, y2r])
+    dr = np.matmul(np.vstack((c1,c2)).T, ds)
+    
+    prm = np.log((dr[0]+dr[1]*p[0:3])/rc)
+    # New edit
+    #p= p[::-1]
+    #prm = np.log((dr[0]*p[0:3]+dr[1])/rc)
+    Efac = h1b/(2.*np.pi*1j)*(-0.5)
+    Eprm = np.sum(np.real(Efac*prm))*(-2.0)
+    
+    
+    # Add image contribution (naive summation)
+    # image coordinate (x,y)  image strength
+    image = np.array([[0., 0., 2.],
+                      [dr[0], dr[1], -1.],
+                      [-dr[0], -dr[1], -1.]])
+       
+    xc = np.arange(-xcut, xcut+1)
+    yc = np.arange(-ycut, ycut+1)
+    Xim, Yim = np.meshgrid(xc, yc)
+    Xim = np.tile(Xim.reshape(xc.size,yc.size,1), (1,1,2))
+    Yim = np.tile(Yim.reshape(xc.size,yc.size,1), (1,1,2))
+    offset = Xim*c1 + Yim*c2
+    offset = offset.reshape(-1,2)
+        
+    Esum = np.zeros((3,), dtype=complex)
+    offset0 = offset[(offset[:,0]!=0)|(offset[:,1]!=0)]
+    for k in range(image.shape[0]):
+        dR = offset0 + image[k,0:2]
+        tmp = np.log((np.tile(dR[:,0], (3,1)).T + np.outer(dR[:,1], p[0:3]))/rc)
+        Esum += image[k,2]*np.sum(tmp, axis=0)
+    
+    
+    # Add ghost contribution (correction for conditional convergence)
+    # ghost coordinate (x,y)        ghost strength
+    ghost = np.array([[ c1[0]/2.-dr[0]/2.,  c1[1]/2.-dr[1]/2.,  x2r],
+                      [-c1[0]/2.-dr[0]/2., -c1[1]/2.-dr[1]/2., -x2r],
+                      [ c1[0]/2.+dr[0]/2.,  c1[1]/2.+dr[1]/2., -x2r],
+                      [-c1[0]/2.+dr[0]/2., -c1[1]/2.+dr[1]/2.,  x2r],
+                      [ c2[0]/2.-dr[0]/2.,  c2[1]/2.-dr[1]/2.,  y2r],
+                      [-c2[0]/2.-dr[0]/2., -c2[1]/2.-dr[1]/2., -y2r],
+                      [ c2[0]/2.+dr[0]/2.,  c2[1]/2.+dr[1]/2., -y2r],
+                      [-c2[0]/2.+dr[0]/2., -c2[1]/2.+dr[1]/2.,  y2r]])
+        
+    Egst = np.zeros((3,), dtype=complex)
+    for k in range(ghost.shape[0]):
+        dR = offset + ghost[k,0:2]
+        tmp = np.log((np.tile(dR[:,0], (3,1)).T + np.outer(dR[:,1], p[0:3]))/rc)
+        Egst -= ghost[k,2]*np.sum(tmp, axis=0)
+    
+    Esum = Esum + Egst
+    Eimg = np.sum(np.real(Efac*Esum))
+    Eel = Eprm + Eimg
+
+    return Eel, Eprm, Eimg
+
+'''
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Function: madsum_cubic()
+%%
+%% Nicolas Bertin, bertin1@llnl.gov
+%% Based on the implemetation by Wei Cai, caiwei@stanford.edu
+%%
+%% References:
+%%
+%%  1. W. Cai, Atomistic and Mesoscale Modeling of Dislocation Mobility, 
+%%     Ph. D. Thesis, Massachusetts Institute of Technology, 2001. 
+%%     ( http://asm.mit.edu/caiwei/Download/Thesis/CaiWeiThesis.pdf 
+%%       p. 296, for dislocation interaction energy in anisotropic medium. )
+%%
+%%  2. Wei Cai, Vasily V. Bulatov, Jinpeng Chang, Ju Li and Sidney Yip,
+%%     Periodic image effects in dislocation modelling,
+%%     Philosophical Magazine A, 83, 539 (2003).
+%%     ( for regularization of conditional convergence )
+%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+%  This program calculates the elastic energy of a dislocation
+%  dipole in a supercell under periodic boundary conditions
+%   
+%  Geometry:
+%
+%    (x1,y1)   A-------------------------------------
+%               \                                    \
+%                \      P                             \
+%                 \    (-) (x2r,y2r)                   \
+%                  \   /                                \
+%                   \ /                                  \
+%                   (+)-----------------------------------B (x0,0)
+%
+%  Input:
+%     C  = [C11, C12, C44] cubic elastic constants (in eV/A^3,  1eV/A^3 = 160.22GPa )
+%     b0 = [ bx, by, bz ] Burgers vector in unit cell frame (in Angstrom)
+%                        e.g. b0 = [ 1 1 1 ]/2 * 3.1472 (for Molybdenum)
+%     M = [ e1, e2, e3 ] coordinate transformation matrix, 
+%                        e3 is parallel to dislocation line
+%     rc:   cut-off radius
+%     coords = [ x0, x1, y1, x2r, y2r ]
+%           x0            x coord of B     (0, infty)     (in A)
+%           x1            x coord of A     (-infty,infty) (in A)
+%           y1            y coord of A     (0,  infty)
+%           x2r   reduced x coord of P     (-0.5, 0.5]
+%           y2r   reduced y coord of P     (-0.5, 0.5]
+%    trunc = [ xcut, ycut ] truncation paramters
+%           -xcut:xcut times -ycut:ycut number of images will be added
+%     
+%  Output:
+%     Eel:  total elastic energy, Eel = Eprm + Eimg
+%     Eprm: primary dipole energy
+%     Eimg: image energy
+%     Esum = [ lnR, xxR2, yyR2, xyR2 ] : intermediate results
+%            lnR :    sum of ln(R/rc)
+%            xxR2:    sum of x*x/R^2
+%            yyR2:    sum of y*y/R^2
+%            xyR2:    sum of x*y/R^2
+%
+'''
+def madsum_cubic(C, b0, M, rc, coord, trunc):
+    
+    C11 = C[0]
+    C12 = C[1]
+    C44 = C[2]
+    
+    # Voigt elasticity matrix
+    C66 = np.array([[C11,C12,C12,0.,0.,0.],
+                    [C12,C11,C12,0.,0.,0.],
+                    [C12,C12,C11,0.,0.,0.],
+                    [0.,0.,0.,C44,0.,0.],
+                    [0.,0.,0.,0.,C44,0.],
+                    [0.,0.,0.,0.,0.,C44]])
+    
+    # Voigt notation
+    cind=np.array([[0,5,4],[5,1,3],[4,3,2]])
+    C0 = np.zeros((3,3,3,3))
+    for i in range(3):
+        for j in range(3):
+            for k in range(3):
+                for l in range(3):
+                    C0[i,j,k,l] = C66[cind[i,j],cind[k,l]]
+    
+    return madsum_aniso(C0, b0, M, rc, coord, trunc)
+
+
+def find_burgers_coord(theta, c2, n2, c3, n3):
+    
+    # compute Burgers vector in scaled coordinates
+    d2 = n2*c2
+    d3 = n3*c3
+    
+    det = d2[0]*d3[1]-d2[1]*d3[0]
+    if np.abs(det) > 1e20:
+        a = 0.5*(d3[1]-d3[0])/det
+        b = 0.5*(d2[0]-d2[1])/det
+    else:
+        det = d2[2]*d3[1]-d2[1]*d3[2]
+        a = 0.5*(d3[1]-d3[2])/det
+        b = 0.5*(d2[2]-d2[1])/det
+        
+    # make sure always remove atom, not insert atom
+    if theta < 0:
+        a = -a
+        b = -b
+    
+    return np.array([0.,a,b])
+
+def dipole_parameter_generation(burgers_vector_vector,dislocation_line_direction_vector,slip_plane_direction_vector,mult,ar,n2,n3):
+    bv = np.array(burgers_vector_vector) # Burgers vector direction
+    c3 = np.array(dislocation_line_direction_vector) # dislocation plane index
+    c1 = np.array(slip_plane_direction_vector)
+    y0 = np.cross(c1, bv)
+    y0 =  y0.astype(int)
+    my = np.gcd(y0[0], np.gcd(y0[1], y0[2]))
+    y0 = y0 / my
+    x = bv / np.linalg.norm(bv)
+    y = y0 / np.linalg.norm(y0)
+    # maximum Miller index of repeat vectors allowed to
+    # generate supercells of various character angles
+    nmax = 10
+    c3n = np.linalg.norm(c3)
+    c3x = np.dot(c3, x)
+    c3y = np.dot(c3, y)
+    angle = np.arctan2(c3y, c3x)*180.0/np.pi
+
+    # compute complementary supercell repeat vector
+    c2 = np.cross(c3, c1)
+    c2 =  c2.astype(int)
+    # determine supercell size
+    #for ii in len(c2[:,0]):
+    #    m2[ii] = np.gcd(int(c2[ii,0]), np.gcd(int(c2[ii,1]), int(c2[ii,2])))
+    m2 = np.gcd(c2[0], np.gcd(c2[1], c2[2]))
+    cm2 = c2 / m2
+    l2 = np.linalg.norm(cm2)
+    n2 = np.ceil(mult*n2/l2)
+
+    c3 =  c3.astype(int)
+    m3 = np.gcd(c3[0], np.gcd(c3[1], c3[2]))
+    cm3 = c3 / m3
+    l3 = np.linalg.norm(cm3)
+    n3 = np.ceil(mult*n3/l3)
+
+    # adjust aspect ratio
+    cm1 = c1
+    l1 = np.linalg.norm(cm1)
+    n1 = np.round(ar*n2*l2/l1)
+    bs = find_burgers_coord(angle, cm2, n2, cm3, n3)
+    return c1, n1, cm2, n2, cm3, n3, bs
+
+def get_miller_index(inder_string):
+    newstr = "".join((ch if ch in "0123456789.-e" else " ") for ch in inder_string)
+    miller_index = [float(i) for i in newstr.split()]
+    index = (
+        str(miller_index[0]) + " " + str(miller_index[1]) + " " + str(miller_index[2])
+    )
+    return index
+
+
+def get_miller_index_vector(inder_string):
+    newstr = "".join((ch if ch in "0123456789.-e" else " ") for ch in inder_string)
+    miller_index = [float(i) for i in newstr.split()]
+    return miller_index
+
+
+def get_the_dislocation_core_radius(Core_Radius_string):
+    newstr = "".join(
+        (ch if ch in "0123456789.-e" else " ") for ch in Core_Radius_string
+    )
+    Core_Radius_index = [float(i) for i in newstr.split()]
+    return Core_Radius_index
+
+def get_error_bar(core_enenrgies_array):
+    E_core_avg = np.mean(core_enenrgies_array)
+    E_core_max = abs(max(core_enenrgies_array)-E_core_avg)
+    E_core_min = abs(min(core_enenrgies_array)-E_core_avg)
+    E_core = np.array([E_core_avg,E_core_max,E_core_min])
+    return E_core
+
+# Read elements, masses, and model from stdin
+element = input("Elements: ")
+print(element)
+mass = input("Masses in g/mol (must match order of elements above): ")
+print(mass)
+model = input("Model: ")
+print(model)
+lattice_type = input("Lattice type: ")
+print(lattice_type)
+dislocation_core_radius_seq = input("dislocation core radius: ")
+print(dislocation_core_radius_seq)
+burgers_vector_direction = input("burgers vector direction: ")
+print(burgers_vector_direction)
+slip_plane_miller_indices = input("slip plane miller indices: ")
+print(slip_plane_miller_indices)
+dislocation_line_direction = input("dislocation line direction: ")
+print(dislocation_line_direction)
+multiple_factor = input("multiple factor: ")
+print(multiple_factor)
+print("")
+
+# Some directories we need
+THIS_DIR = os.path.dirname(__file__)
+MAIN_LAMMPS_INPUT_TEMPLATE = open(
+    os.path.join(THIS_DIR, "min_cg_npt_w.in.template")
+).read()
+DISLOCATION_DIPOLE_TEMPLATE = open(
+    os.path.join(THIS_DIR, "DISLOCATION_DIPOLE.TEMPLATE")
+).read()
+INDIR = os.path.join("output", "lammps_inputs")
+OUTDIR = os.path.join("output", "lammps_output_log")
+DUMPDIR = os.path.join("output", "dumpfile")
+
+# Ensure the directories we need are created
+try:
+    os.makedirs(INDIR)
+except OSError:
+    pass
+try:
+    os.makedirs(OUTDIR)
+except OSError:
+    pass
+try:
+    os.makedirs(DUMPDIR)
+except OSError:
+    pass
+
+# Remove the spece from input.
+species = " ".join(element.split())
+
+# Calculate the equilibrium lattice constant
+equilibrium_lattice_constant = get_lattice_constant_cubic(
+    [model], [lattice_type], [species], ["angstrom"]
+)[0]
+
+print("equilibrium lattice constant is", equilibrium_lattice_constant)
+
+# Calculate the equilibrium lattice constant
+cohesive_energy_final = get_cohesive_energy_cubic(
+    [model], [lattice_type], [species], ["eV"]
+)[0]
+
+print("cohesive energy is", cohesive_energy_final)
+
+# Calculate the elastic constants
+elastic_constants = get_elastic_constants_isothermal_cubic(
+    [model], [lattice_type], [species], ["GPa"]
+)
+
+
+# The elastic constant transfer.
+
+C11 = elastic_constants[0]
+C12 = elastic_constants[1]
+C44 = elastic_constants[2]
+
+bulk_modulus = 1 / 3 * (C11 + 2 * C12)
+G_v = (3 * C44 + C11 - C12) / 5
+G_r = (C44 * 5 * (C11 - C12)) / (4 * C44 + 3 * (C11 - C12))
+shear_modulus = (G_v + G_r) / 2
+poission_ratio = (3 * bulk_modulus - 2 * shear_modulus) / (
+    2 * (3 * bulk_modulus + shear_modulus)
+)
+
+# set necessary input parameters in input files
+latticestructure = get_lattice_type_full_name(lattice_type)
+final_value = []
+Main_result = []
+burgers_vector = get_miller_index(burgers_vector_direction)
+burgers_vector_vector = get_miller_index_vector(burgers_vector_direction)
+print(burgers_vector)
+
+slip_plane_direction = get_miller_index(slip_plane_miller_indices)
+slip_plane_direction_vector = get_miller_index_vector(slip_plane_miller_indices)
+print(slip_plane_direction)
+
+dislocation_line_direction = get_miller_index(dislocation_line_direction)
+dislocation_line_direction_vector = get_miller_index_vector(dislocation_line_direction)
+print(dislocation_line_direction)
+
+multiple_factor_vector  =  get_miller_index_vector(multiple_factor)  
+
+
+dislocation_core_radius = get_the_dislocation_core_radius(dislocation_core_radius_seq)
+print(dislocation_core_radius)
+
+
+#latticesize = y_direction_vector+b02_orig + slip_plane_direction_vector +b01_orig+ dislocation_line_direction_vector+ b03_orig
+#print(latticesize)
+# multi =1
+#tilt =25
+##latticesize[7] = multi*latticesize[7]
+##latticesize[3] = multi*latticesize[3]
+##latticesize[11] = multi*latticesize[11]
+##c1x= latticesize[0] * latticesize[3]
+##c1y= latticesize[1] * latticesize[3]
+##c1z= latticesize[2] * latticesize[3]
+
+##c3x= latticesize[8] * latticesize[11]
+##c3y= latticesize[9] * latticesize[11]
+##c3z= latticesize[10] * latticesize[11]
+
+
+##det = c1x*c3y-c1y*c3x
+#puts "$c1x $c1y $c1z  $c3x $c3y $c3z"
+#puts "det = $det"
+#if  det != 0:
+##    a = 0.5*(c3y-c3x) / det
+##    b = 0.5*(c1x-c1y) / det
+#else:
+#    det = c1z*c3y-c1y*c3z
+#    if det == 0:
+#       sys.exit("det must not be zore")
+#    a = 0.5*(c3y-c3z)/det
+#    b = 0.5*(c1z-c1y)/det
+#
+#if tilt < 0:
+#    a = -a
+#    b = -b
+
+
+# supercell size
+#ar = 1.5 # aspect ratio x/y
+#n2 = 10.0 # supercell size along the y-direction
+#n3 = 3.0 # supercell size along the z-direction
+mults = multiple_factor_vector # multiplication factor
+
+E_core_final_nonsingular = []
+E_core_final_iso = []
+E_core_final_cub = []
+coords = []
+length_b03 = np.array([])
+# The loop for generate total energy of supercell containing dipole structure
+for mult in mults:
+    ar = 1.5 # aspect ratio x/y
+    n2 = 10.0 # supercell size along the y-direction
+    n3 = 3.0 # supercell size along the z-direction
+    c1, n1, c2, n2, c3, n3, bs = dipole_parameter_generation(burgers_vector_vector,dislocation_line_direction_vector,slip_plane_direction_vector,mult,ar,n2,n3)
+    print(c1, n1, c2, n2, c3, n3, bs)
+    length_b03 = np.append(length_b03,n3)
+    Dipole_creation_file = os.path.join(
+        INDIR, "DISLOCATION_DIPOLE.TEMPLATE_" + str(mult) + ".scripts"
+    )
+
+    with open(Dipole_creation_file, "w") as creation_file:
+        creation_file.write(
+            DISLOCATION_DIPOLE_TEMPLATE.format(
+                DIRNAME=INDIR,
+                latticestructure=latticestructure,
+                lattice_constant=equilibrium_lattice_constant,
+                poission_ratio=poission_ratio,
+                dipole_direction_0=c1[0], ## make sure change in Dipole Template(all the three)
+                dipole_direction_1=c1[1],
+                dipole_direction_2=c1[2],
+                y_direction_0=c2[0],
+                y_direction_1=c2[1],
+                y_direction_2=c2[2],
+                dislocation_line_direction_0=c3[0],
+                dislocation_line_direction_1=c3[1],
+                dislocation_line_direction_2=c3[2],
+                length_b01 = n1,
+                length_b02 = n2, 
+                length_b03 = n3,
+                bs0   =  bs[0],
+                bs1   =  bs[1],
+                bs2   =  bs[2],
+                mult  =  mult,
+            )
+        )
+    subprocess.call(["md_gpp", Dipole_creation_file])
+
+    with gzip.open(
+        os.path.join(
+            INDIR + "/dipole_ref/", "makedp_mult_" + str(mult) + ".lammps.gz"
+        ),
+        "rb",
+    ) as f_in:
+        with open(
+            os.path.join(
+                INDIR + "/dipole_ref/", "makedp_mult_" + str(mult) + ".lammps"
+            ),
+            "wb",
+        ) as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+    makedpfile = open(
+        os.path.join(
+            INDIR + "/dipole_ref/", "makedp_mult_" + str(mult) + ".lammps"
+        )
+    ).read()
+    infile = os.path.join(INDIR, "min_cg_npt_w.in.template")  ##
+    xyzfile = os.path.join(INDIR, "makedp_b01_" + str(mult) + ".lammps")
+    logfile = os.path.join(
+        OUTDIR, "equilibrate_npt_disloc_dislocation_mult_" + str(mult) + ".log"
+    )
+    dumpfile = os.path.join(
+        DUMPDIR, "makedp_npt_dislocation_mult_" + str(mult) + ".dump.gz"
+    )
+
+    ### REGULAR EXPRESSIONS FOR MATCHING LAMMPS OUTPUT
+    # Read xyz file, convert the cell to LAMMPS' convention and create a
+    # dump file to read in
+    # NOTE: using a dump file rather than a data file means that it's not
+    #       sensitive to the specific atom_style in the event that we're
+    #       running with an SM, e.g. if the atom_style of the SM is
+    #       'charge', charges of zero will simply be assigned to each atom
+    #       since they're not specified in the dumpfile
+    with open(xyzfile, "w") as xyz_file:
+        xyz_file.write(makedpfile.format())
+
+    # Create the LAMMPS input file
+    with open(infile, "w") as in_file:
+        in_file.write(
+            MAIN_LAMMPS_INPUT_TEMPLATE.format(
+                modelname=model,
+                symbol=element,
+                xyzfile=xyzfile,
+                mass=mass,
+                dumpfile=dumpfile,
+                lattice_type=lattice_type,
+            )
+        )
+    run_lammps(infile, logfile)
+    [pos,cvec] = extract_position(dumpfile)
+    c1vec = cvec[0]
+    c2vec = cvec[1]
+    pos1 = pos[0]
+    pos2 = pos[1]
+    # Supercell orientation
+    # Dipole position
+    x0 = c1vec[0]
+    x1 = c2vec[0]
+    y1 = c2vec[1]
+    if pos1[0] < pos2[0]:
+       r2 = pos2-pos1
+    else:
+       r2 = pos1-pos2
+    S = np.array([[x0,x1],[0.,y1]])
+    dr = np.matmul(np.linalg.inv(S), r2)
+    print("these are S, r2, dr", S, r2,dr)
+    x2r = dr[0]
+    y2r = dr[1]
+    coord = [x0,x1,y1,x2r,y2r]
+    coords.append(coord)
+    ### Now process the output and dumpfile for relevant information
+    # Get Dislocation energy
+    with open(logfile) as outfl:
+        lines = outfl.readlines()
+    try:
+        temp_value = []
+        for line in lines:
+            line_split = line.split()
+            if len(line_split) <= 10:
+                line_split = []
+            zzz = []
+            if line_split:
+                try:
+                    for item in line_split:
+                        zzz.append(float(item))
+                    temp_value.append(zzz)
+                except:
+                    continue
+            zz = 0
+            for index in range(0, len(temp_value)):
+                if temp_value[index][0] >= temp_value[zz][0]:
+                    zz = index
+                    Main_result = temp_value[zz]
+    except AttributeError:
+        raise Exception(
+            "Error: Failed to find the dislocation  energy in the LAMMPS output log"
+        )
+    print(Main_result)
+    useful_value = [
+        n1,
+        Main_result[1],
+        -cohesive_energy_final,
+        0.0000000e00,
+        Main_result[4],
+        Main_result[8],
+        Main_result[9],
+        Main_result[10],
+        Main_result[11],
+        Main_result[12],
+        Main_result[13],
+    ]
+    final_value.append(useful_value)
+
+# Calculate the dislocation core energy at different cut-off core radius
+
+x = np.array(c1)  # x: dipole direction
+y = np.array(c2)  # y:
+z = np.array(c3)  # z: line direction
+
+rlatt = equilibrium_lattice_constant
+
+alatt = rlatt * np.linalg.norm(x)
+# <110> direction is the dipole direction -> b01
+blatt = rlatt * np.linalg.norm(y) ##
+# <112> direction -> b02
+clatt = rlatt * np.linalg.norm(z)
+
+for core_radius in dislocation_core_radius:
+    mu = shear_modulus  # mu in units to compute "nu" input vailable
+    nu = poission_ratio  # mu and nu shuold be input for the test
+    mu = mu / 160.22  # mu in units required to MadSum
+    pi = math.pi
+
+    mod_b = np.linalg.norm([i / 2 * rlatt for i in burgers_vector_vector])
+    #
+    ## geometry of the simulation box
+    b = 0.5*np.array(burgers_vector_vector)  # b: burgers vector
+    x1n = np.sqrt(np.sum(x**2))
+    y1n = np.sqrt(np.sum(y**2))
+    z1n = np.sqrt(np.sum(z**2))
+
+    M = np.vstack((x/x1n,y/y1n,z/z1n)).T
+    print("this is M", M)
+    # b = z   # dislocation dipole
+    #
+    ## Obtaining angle between axes and b = [ 1 1 1]/2
+
+    delta = math.acos(round(np.dot(b, x) / (np.linalg.norm(b) * np.linalg.norm(x)), 8))
+    print("delta = angle(b,x) [degrees]= ", delta * 180 / pi)  # ; display(str) #
+    phi = math.acos(round(np.dot(b, y) / (np.linalg.norm(b) * np.linalg.norm(y)), 8))
+    print("phi = angle(b,y) [degrees]= ", phi * 180 / pi)  # ; display(str)
+    theta = math.acos(round(np.dot(b, z) / (np.linalg.norm(b) * np.linalg.norm(z)), 8))
+    print("theta = angle(b,z) [degrees]= ", theta * 180 / pi)  # ; display(str)
+
+    #
+    ## burgers vector in MADSUM format
+    #
+    b_madsum = np.array(
+        [
+            i * np.linalg.norm(b) * rlatt
+            for i in [math.cos(delta), math.cos(phi), math.cos(theta)]
+        ]
+    )
+
+
+    N = core_radius
+    rc = N * mod_b
+    cut = np.array([10, 10])
+    # rc =1;
+    #b = b_madsum
+    b0 = np.array([0.5*ii*equilibrium_lattice_constant for ii in burgers_vector_vector])
+    b = np.matmul(M.T, b0)
+    E_min_dislocation_npt_cea = np.array(final_value)
+    Eel_nonsingular = np.array([])
+    Eprm_nonsingular = np.array([])
+    Eimg_nonsingular = np.array([])
+    Eel_iso = np.array([])
+    Eprm_iso = np.array([])
+    Eimg_iso = np.array([])
+    Eel_cub = np.array([])
+    Eprm_cub = np.array([])
+    Eimg_cub = np.array([])
+    E_residual = np.array([])
+    E_atom_A= np.array([])
+
+    for mult in range(len(mults)):  # 10, number of components of b01
+        coord = coords[mult]
+        #coord = np.array([b01 * alatt, 0, b02 * blatt, 0.5, 0])
+        #print(mu, nu, b, rc, coord, cut, theta)
+        ### singular solution
+        # [p1, p2, p3, Esum] = madsum_iso_dislocation(mu, nu, b, rc, coord, cut) #
+        ### non singular solution
+        p_non1, p_non2, p_non3 = madsum_nonsingular(mu, nu, b, rc, coord, cut) ### Eel[i], Eprm[i], Eimg[i] = madsum_nonsingular(mu, nu, b, rc, coord, cut)
+        p_iso1, p_iso2, p_iso3 = madsum_iso(mu, nu, b, rc, coord, cut) ### el[i], Eprm[i], Eimg[i] = madsum_iso(mu, nu, b, rc, coord, cut)
+        #b0 = [ii*equilibrium_lattice_constant for ii in burgers_vector_vector]
+        CC = np.array(elastic_constants)/160.22
+        print("coord, b0, M, b before madsum function:", coord,b0,M,b,CC)
+        p_cub1, p_cub2, p_cub3 = madsum_cubic(CC, b0, M, rc, coord, cut)### Eel[i], Eprm[i], Eimg[i] = madsum_cubic(C, b0, M, rc, coord, cut)
+        
+        #print(p1, p2, p3)
+        #r_b01 = np.append(r_b01, b01)
+        Eel_nonsingular = np.append(Eel_nonsingular, p_non1)
+        Eprm_nonsingular = np.append(Eprm_nonsingular, p_non2)
+        Eimg_nonsingular = np.append(Eimg_nonsingular, p_non3)
+        Eel_iso = np.append(Eel_iso, p_iso1)
+        Eprm_iso = np.append(Eprm_iso, p_iso2)
+        Eimg_iso = np.append(Eimg_iso, p_iso3)
+        Eel_cub = np.append(Eel_cub, p_cub1)
+        Eprm_cub = np.append(Eprm_cub, p_cub2)
+        Eimg_cub = np.append(Eimg_cub, p_cub3)
+        print("This is Eel non iso cub", Eel_nonsingular, Eel_iso, Eel_cub)
+        # fig1 = plt.figure()
+        # plt.plot(r_b01,Eel,'r--',r_b01,Eprm,'g--',r_b01,Eimg,'b--')
+        # plt.legend(['E.elast','Eprm','Eimg'],loc=0)
+        # plt.ylabel('E (eV/A)',fontsize=14)
+        # plt.xlabel('b01 ( units of a_{110})',fontsize=14)
+        # plt.title('W CEA vs4 ; DISLOCATION; rc='+str(N),fontsize=14)
+        # plt.grid(True)
+        # plt.savefig('output/figure1_'+str(core_radius)+'.png')
+
+        # figure printing scripts------------------------
+
+        # ---------------------------------------------------
+        #print("this is E_cub", Eprm_cub, Eel_cub, Eimg_cub)
+        #mu = shear_modulus  # mu in units to compute "nu"
+        #B = bulk_modulus  # input vailable
+
+        ## Residual stress
+
+        # E_residual=residual_stress_cea(rlatt,mu,nu,b01,b02,b03,alatt,blatt,clatt);
+
+        # mu = 161; nu = 0.284;
+        #shear_modulus = shear_modulus * 1000  # in MPa...161 GPa
+        #lamb = (2 * nu * shear_modulus) / (1 - 2 * nu)
+        c_44 = C44*1000
+        c_12 = C12*1000
+        c_11 = C11*1000
+        C = np.zeros([6, 6])
+        C[0, 0] = c_11
+        C[1, 1] = c_11
+        C[2, 2] = c_11
+        C[0, 1] = c_12
+        C[0, 2] = c_12
+        C[1, 0] = c_12
+        C[1, 2] = c_12
+        C[2, 0] = c_12
+        C[2, 1] = c_12
+        C[3, 3] = c_44
+        C[4, 4] = c_44
+        C[5, 5] = c_44
+        C  # GPa
+        S = np.linalg.inv(C)
+        ## E_min_dislocation_npt_cea = np.loadtxt(os.path.join(THIS_DIR , "E_min_dislocation_npt_cea.dat"))
+        print("Here is E_min_dislocation_npt_cea",E_min_dislocation_npt_cea)
+
+        # load E_min_dislocation_npt_cea
+        # Sigma = E_min_dislocation_npt_cea (:,6:11)/10
+        # for j=1:5
+        #     #Sigma = E_min_dislocation_npt_cea (:,5:11)/10 ; #Pij in LAMMPS (metal units) are in bar=0.1 MPa
+        #     E_residual(j)= Sigma(j,:)*S*Sigma(j,:)'; # E_residual in MPa = MJ/m^3
+        #     #Sigma
+        # end
+        
+        Sigma = []
+        for i in range(0, 6):
+            Sigma.append(
+                E_min_dislocation_npt_cea[mult, 5 + i] / 10
+            )  # Pij in LAMMPS (metal units) are in bar=0.1 MPa
+        E_residual_temp = np.dot(np.dot(Sigma, S), np.transpose(Sigma))  # Sigma*S*Sigma'(original); # E_residual in MPa = MJ/m^3    
+        Vol= n1 * alatt * (10 ** -10) * n2 * blatt * (10 ** -10) * n3 * clatt * (10 ** -10)
+        # Vol in m^3
+        E_residual_temp  = E_residual_temp * (10 ** 6) * Vol/ (1.602e-19)
+        # E_residual in J
+        E_residual = np.append(E_residual,E_residual_temp)
+        # E_residual in eV
+        print("N3:",n3)
+        E_atm_A_temp = (
+            np.array(E_min_dislocation_npt_cea[mult, 4])
+            - np.array(
+                np.multiply(
+                    E_min_dislocation_npt_cea[mult, 1], E_min_dislocation_npt_cea[mult, 2]
+                )
+            )
+            - np.array(np.transpose(E_residual_temp) / 2)
+        ) / (length_b03[mult] * clatt)
+        print("Here is E_atm_A_temp and E_residual_temp",E_atm_A_temp, E_residual_temp)
+        E_atom_A = np.append(E_atom_A,E_atm_A_temp)
+    #E_atm_A = (
+    #    np.array(E_min_dislocation_npt_cea[:, 4])
+    #    - np.array(
+    #        np.multiply(
+    #            E_min_dislocation_npt_cea[:, 1], E_min_dislocation_npt_cea[:, 2]
+    #        )
+    #    )
+    #   ) / (b03 * clatt)
+    # eV/A exp. 5.16 book Wei Cai and Vasily Bulatov
+    print("This is E_atom_A and E_residual", E_atom_A,  E_residual)
+    E_elastic_nonsingular = np.array(np.transpose(Eel_nonsingular))
+    E_elastic_iso = np.array(np.transpose(Eel_iso))
+    E_elastic_cub = np.array(np.transpose(Eel_cub))
+    E_core_A_nonsingular = (E_atom_A - E_elastic_nonsingular) / 2
+    E_core_A_iso = (E_atom_A - E_elastic_iso) / 2
+    E_core_A_cub = (E_atom_A - E_elastic_cub) / 2
+    print("E_core_iso cub and non vs2:", E_core_A_nonsingular,E_core_A_iso, E_core_A_cub)
+    ####
+    #
+    #
+    # fig3 = plt.figure()
+    # plt.plot(
+    #     E_min_dislocation_npt_cea[:, 0],
+    #     E_atm_A,
+    #     "g--",
+    #     E_min_dislocation_npt_cea[:, 0],
+    #     E_elastic,
+    #     "r--",
+    #     E_min_dislocation_npt_cea[:, 0],
+    #     E_core_A,
+    #     "b--",
+    # )
+    # plt.legend(["E.atomistic_A", "Eelastic_A", "Ecore_A"], loc=0)
+    # plt.ylabel("E (eV/A)", fontsize=14)
+    # plt.xlabel("b01 ([-110])", fontsize=14)
+    # plt.title("DISLOCATION; rc= " + str(N) + "b", fontsize=14)
+    # plt.grid(True)
+    # plt.savefig("output/figure3_" + str(N) + ".png")
+
+    # Find Dislocation core energy
+    # set a convergence error
+    # print('the dislocation core energy is', E_core_A)
+    # E_diff_core = abs(np.diff(E_core_A))
+    # E_core_index = np.nonzero(E_diff_core < 0.01) # set a convergence  percentage
+    # E_core_final = E_core_A[E_core_index[0]]
+    # print(E_core_final)
+    #print(E_min_dislocation_npt_cea[:, 0],E_core_A_nonsingular)
+    E_core_nonsingular_temp = get_error_bar(E_core_A_nonsingular)
+    E_core_final_nonsingular= np.append(E_core_final_nonsingular,E_core_nonsingular_temp)
+    E_core_iso_temp = get_error_bar(E_core_A_iso)
+    E_core_final_iso = np.append(E_core_final_iso, E_core_iso_temp)
+    E_core_cub_temp = get_error_bar(E_core_A_cub)
+    E_core_final_cub = np.append(E_core_final_cub, E_core_cub_temp)
+
+
+print("core energy of nonsingular elastic model",E_core_final_nonsingular)
+print("core energy of iso elastic model",E_core_final_iso)
+print("core energy of cub elastic model",E_core_final_cub)
+
+
+### nonsingular plot
+log_core_radius = np.log(dislocation_core_radius)
+
+#[a_index_nonsingular, b_index_nonsingular] = np.polyfit(log_core_radius, E_core_final_nonsingular, 1)
+#xnew = np.linspace(min(dislocation_core_radius), max(dislocation_core_radius), 300)
+#y_nonsingular = a_index_nonsingular * np.log(xnew) + b_index_nonsingular
+
+#fig4 = plt.figure()
+#plt.plot(dislocation_core_radius, E_core_final_nonsingular, "*", xnew, y_nonsingular, "g-")
+E_core_nonsingular_avg = np.array([E_core_final_nonsingular[ii*3] for ii in range(int(len(E_core_final_nonsingular)/3))])
+E_core_nonsingular_max = np.array([E_core_final_nonsingular[ii*3+1] for ii in range(int(len(E_core_final_nonsingular)/3))])
+E_core_nonsingular_min = np.array([E_core_final_nonsingular[ii*3+2] for ii in range(int(len(E_core_final_nonsingular)/3))])
+[a_index_nonsingular, b_index_nonsingular] = np.polyfit(log_core_radius, E_core_nonsingular_avg, 1)
+xnew = np.linspace(min(dislocation_core_radius), max(dislocation_core_radius), 300)
+y_nonsingular = a_index_nonsingular * np.log(xnew) + b_index_nonsingular
+
+fig4 = plt.figure()
+plt.plot(xnew, y_nonsingular, "g-")
+plt.errorbar(dislocation_core_radius, E_core_nonsingular_avg, yerr = (E_core_nonsingular_min,E_core_nonsingular_max),fmt='o',ecolor='r',color='b',elinewidth=2,capsize=4)
+#plt.plot(dislocation_core_radius, E_core_nonsingular_avg, "*", xnew, y_nonsingular, "g-")
+plt.legend(["Core energy of nonsingular linear elasticity fitting function"], loc=0)
+plt.ylabel("E_core[\u03B8=0,a](eV/A)", fontsize=14)
+plt.xlabel("a (units of b)", fontsize=14)
+# plt.title('DISLOCATION; rc= '+str(N)+'b',fontsize=14)
+plt.grid(True)
+plt.savefig("output/figure4.png")
+
+
+### iso plot
+#[a_index_iso, b_index_iso] = np.polyfit(log_core_radius, E_core_final_iso, 1)
+#xnew = np.linspace(min(dislocation_core_radius), max(dislocation_core_radius), 300)
+#y_iso = a_index_iso * np.log(xnew) + b_index_iso
+
+#fig5 = plt.figure()
+#plt.plot(dislocation_core_radius, E_core_final_iso, "*", xnew, y_iso, "g-")
+E_core_iso_avg = np.array([E_core_final_iso[ii*3] for ii in range(int(len(E_core_final_iso)/3))])
+E_core_iso_max = np.array([E_core_final_iso[ii*3+1] for ii in range(int(len(E_core_final_iso)/3))])
+E_core_iso_min = np.array([E_core_final_iso[ii*3+2] for ii in range(int(len(E_core_final_iso)/3))])
+
+[a_index_iso, b_index_iso] = np.polyfit(log_core_radius, E_core_iso_avg, 1)
+xnew = np.linspace(min(dislocation_core_radius), max(dislocation_core_radius), 300)
+y_iso = a_index_iso * np.log(xnew) + b_index_iso
+
+fig5 = plt.figure()
+plt.plot(xnew, y_iso, "g-")
+plt.errorbar(dislocation_core_radius, E_core_iso_avg, yerr = (E_core_iso_min,E_core_iso_max),fmt='o',ecolor='r',color='b',elinewidth=2,capsize=4)
+#plt.plot(dislocation_core_radius, E_core_final_iso, "*", xnew, y_iso, "g-")
+plt.legend(["Core energy of isotropioc linear elasticity fitting function"], loc=0)
+plt.ylabel("E_core[\u03B8=0,a](eV/A)", fontsize=14)
+plt.xlabel("a (units of b)", fontsize=14)
+# plt.title('DISLOCATION; rc= '+str(N)+'b',fontsize=14)
+plt.grid(True)
+plt.savefig("output/figure5.png")
+
+
+# ## cubic plot
+
+#[a_index_cub, b_index_cub] = np.polyfit(log_core_radius, E_core_final_cub, 1)
+#xnew = np.linspace(min(dislocation_core_radius), max(dislocation_core_radius), 300)
+#y_cub = a_index_cub * np.log(xnew) + b_index_cub
+
+#fig6 = plt.figure()
+#plt.plot(dislocation_core_radius, E_core_final_cub, "*", xnew, y_cub, "g-")
+E_core_cub_avg = np.array([E_core_final_cub[ii*3] for ii in range(int(len(E_core_final_cub)/3))])
+E_core_cub_max = np.array([E_core_final_cub[ii*3+1] for ii in range(int(len(E_core_final_cub)/3))])
+E_core_cub_min = np.array([E_core_final_cub[ii*3+2] for ii in range(int(len(E_core_final_cub)/3))])
+[a_index_cub, b_index_cub] = np.polyfit(log_core_radius, E_core_cub_avg, 1)
+xnew = np.linspace(min(dislocation_core_radius), max(dislocation_core_radius), 300)
+y_cub = a_index_cub * np.log(xnew) + b_index_cub
+
+fig6 = plt.figure()
+plt.plot(xnew, y_cub, "g-")
+plt.errorbar(dislocation_core_radius, E_core_cub_avg, yerr = (E_core_cub_min,E_core_cub_max),fmt='o',ecolor='r',color='b',elinewidth=2,capsize=4)
+plt.legend(["Core energy of nonisotropioc linear elasticity fitting function"], loc=0)
+plt.ylabel("E_core[\u03B8=0,a](eV/A)", fontsize=14)
+plt.xlabel("a (units of b)", fontsize=14)
+plt.title('DISLOCATION; rc= '+str(N)+'b',fontsize=14)
+plt.grid(True)
+plt.savefig("output/figure6.png")
+
+# Create a property instance
+prop_inst = kim_property_create(1, "/home/openkim/tests/Dislocation_bcc_W__TE_111111111111_002/dislocation-core-energy.edn")
+
+# Set all the key-value pairs for this property instance
+prop_inst = kim_property_modify(
+    prop_inst,
+    1,
+    "key", "short-name",
+           "source-value",
+           "1",
+           lattice_type,
+    "key", "species",
+           *format_species(element, lattice_type),
+    "key", "a",
+           "source-value",
+           equilibrium_lattice_constant,
+           "source-unit",
+           "angstrom",
+    "key", "basis-atom-coordinates",
+           *format_basis_atom_coordinates(get_basis_atom_coordinates(lattice_type)),
+    "key", "space-group",
+           "source-value",
+           get_space_group(lattice_type),
+    "key", "cauchy-stress",
+           "source-value",
+           "1:6",
+           *[0.0] * 6,
+           "source-unit",
+           "GPa",
+    "key", "slip-plane-miller-indices",
+           "source-value",
+           "1:3",
+           *slip_plane_direction_vector,
+    "key", "dislocation-line-direction",
+           "source-value",
+           "1:3",
+           *dislocation_line_direction_vector,
+    "key", "burgers-vector-direction",
+           "source-value",
+           "1:3",
+           *burgers_vector_vector,
+    "key", "dislocation-core-radius",
+           "source-value",
+           "1:9",
+           *dislocation_core_radius,
+    "key", "core-energy-nonsingular",
+           "source-value",
+           "1:9",
+           *E_core_nonsingular_avg,
+           "source-asym-std-uncert-neg",
+           "1:9",
+           *E_core_nonsingular_min,
+           "source-asym-std-uncert-pos",
+           "1:9",
+           *E_core_nonsingular_max,
+           "source-unit",
+           "eV/A",
+           "digits",
+           "5",
+    "key", "core-energy-isotropic",
+           "source-value",
+           "1:9",
+           *E_core_iso_avg,
+           "source-unit",
+           "eV/A",
+           "digits",
+           "5",
+    "key", "core-energy-anisotropic",
+           "source-value",
+           "1:9",
+           *E_core_cub_avg,
+           "source-unit",
+           "eV/A",
+           "digits",
+           "5"
+)
+# Dump the results in a file
+with open("output/results.edn", "w") as fp:
+    kim_property_dump(prop_inst, fp)

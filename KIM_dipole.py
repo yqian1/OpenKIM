@@ -6,22 +6,23 @@ This script generates MD++ supercells for core energy calculations
 The dislocation plane normal is along the x-direction
 The dislocation line is along the z-direction
 Nicolas Bertin, 08/31/2020
+Yichen Qian, revised from the dislocation plane normal at x-direction to y-direction
 '''
 
-def find_burgers_coord(theta, c2, n2, c3, n3):
+def find_burgers_coord(theta, c1, n1, c3, n3):
     
     # compute Burgers vector in scaled coordinates
-    d2 = n2*c2
+    d1 = n1*c1
     d3 = n3*c3
     
-    det = d2[0]*d3[1]-d2[1]*d3[0]
+    det = d1[0]*d3[1]-d1[1]*d3[0]
     if np.abs(det) > 1e20:
         a = 0.5*(d3[1]-d3[0])/det
-        b = 0.5*(d2[0]-d2[1])/det
+        b = 0.5*(d1[0]-d1[1])/det
     else:
-        det = d2[2]*d3[1]-d2[1]*d3[2]
+        det = d1[2]*d3[1]-d1[1]*d3[2]
         a = 0.5*(d3[1]-d3[2])/det
-        b = 0.5*(d2[2]-d2[1])/det
+        b = 0.5*(d1[2]-d1[1])/det
         
     # make sure always remove atom, not insert atom
     if theta < 0:
@@ -97,7 +98,7 @@ n3 = 3.0 # supercell size along the z-direction
 mult = 3.0 # multiplication factor
 
 bv = np.array([1,1,1]) # Burgers vector direction
-c1 = np.array([-1,1,0]) # dislocation plane index
+c2 = np.array([-1,1,0]) # dislocation plane index
 
 # maximum Miller index of repeat vectors allowed to
 # generate supercells of various character angles
@@ -112,10 +113,10 @@ m = np.gcd(p[:,0], p[:,1])
 p = p / m[:, np.newaxis]
 
 # generate global supercell repeat vectors
-if np.abs(np.dot(bv, c1)) > 1e-5:
+if np.abs(np.dot(bv, c2)) > 1e-5:
     raise Exception('Burgers vector and dislocation plane must be orthogonal')
 
-y0 = np.cross(c1, bv)
+y0 = np.cross(c2, bv)
 my = np.gcd(y0[0], np.gcd(y0[1], y0[2]))
 y0 = y0 / my
 x = bv / np.linalg.norm(bv)
@@ -134,13 +135,13 @@ angle = angle[ia]
 c3 = c3[ia]
 
 # compute complementary supercell repeat vector
-c2 = np.cross(c3, c1)
+c1 = np.cross(c2, c3)
 
 # determine supercell size
-m2 = np.gcd(c2[:,0], np.gcd(c2[:,1], c2[:,2]))
-cm2 = c2 / m2[:, np.newaxis]
-l2 = np.linalg.norm(cm2, axis=1)
-n2 = np.ceil(mult*n2/l2)
+m1 = np.gcd(c1[:,0], np.gcd(c1[:,1], c1[:,2]))
+cm1 = c1 / m1[:, np.newaxis]
+l1 = np.linalg.norm(cm1, axis=1)
+n1 = np.ceil(mult*n1/l1)
 
 m3 = np.gcd(c3[:,0], np.gcd(c3[:,1], c3[:,2]))
 cm3 = c3 / m3[:, np.newaxis]
@@ -148,9 +149,9 @@ l3 = np.linalg.norm(cm3, axis=1)
 n3 = np.ceil(mult*n3/l3)
 
 # adjust aspect ratio
-cm1 = np.tile(c1, (c3.shape[0], 1))
-l1 = np.linalg.norm(cm1, axis=1)
-n1 = np.round(ar*n2*l2/l1)
+cm2 = np.tile(c2, (c3.shape[0], 1))
+l2 = np.linalg.norm(cm2, axis=1)
+n2 = np.round(ar*n1*l1/l2)
 
 # select orientations with acceptable Miller indices
 cmax = np.max(np.abs(np.hstack((cm1,cm2,cm3))), axis=1)
@@ -160,7 +161,7 @@ ind = (cmax<=nmax)
 # Burgers vector in scaled coordinates
 bs = np.zeros((angle.size,3))
 for i in range(angle.size):
-    bs[i] = find_burgers_coord(angle[i], cm2[i], n2[i], cm3[i], n3[i])
+    bs[i] = find_burgers_coord(angle[i], cm1[i], n1[i], cm3[i], n3[i])
 
 
 # all supercells data

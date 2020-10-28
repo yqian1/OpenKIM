@@ -93,7 +93,7 @@ def generate_script(celldata, theta):
 
 # supercell size
 ar = 1.5 # aspect ratio x/y
-n2 = 10.0 # supercell size along the y-direction
+n1 = 10.0 # supercell size along the y-direction
 n3 = 3.0 # supercell size along the z-direction
 mult = 3.0 # multiplication factor
 
